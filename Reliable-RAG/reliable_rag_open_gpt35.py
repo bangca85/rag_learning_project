@@ -1,123 +1,167 @@
-from sentence_transformers import SentenceTransformer
-import faiss
-import numpy as np
-import pandas as pd
-from transformers import pipeline
-from langchain.schema import Document
-from langchain.vectorstores.faiss import FAISS
-from langchain.embeddings import HuggingFaceEmbeddings
-from dotenv import load_dotenv
 import os
-from langchain_huggingface import HuggingFaceEmbeddings
-import torch
-from langchain.llms import OpenAI
-from langchain_openai import ChatOpenAI
+from dotenv import load_dotenv
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_community.vectorstores import FAISS
+from sentence_transformers import SentenceTransformer
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_openai import OpenAI as LangChainOpenAI
+from typing import List
+from langchain_community.chat_models import ChatOpenAI
+from langchain.schema import SystemMessage, HumanMessage
+from langchain.prompts import ChatPromptTemplate
+from pydantic import BaseModel, Field
 
-# Check if GPU is available, otherwise use CPU
-device = 0 if torch.cuda.is_available() else -1
-
-
-os.environ["TOKENIZERS_PARALLELISM"] = "false"
-# Load environment variables from '.env' file
+# Load environment variables (make sure you have your OpenAI API key in the .env file)
 load_dotenv()
+openai_api_key = os.getenv("OPENAI_API_KEY")
+if not openai_api_key:
+    raise ValueError("OpenAI API key not found in environment variables!")
 
-# Step 1: Load the CSV file
-file_path = 'data/customers-100.csv'
-df = pd.read_csv(file_path)
+# Step 1: Set up Sentence-BERT embeddings using Hugging Face model
+embedding_model = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
 
-# Step 2: Combine relevant fields into a single text column for embedding
-df['combined_text'] = df['First Name'] + ' ' + df['Last Name'] + ', works for ' + df['Company'] + '. Located in ' + df['City'] + ', ' + df['Country'] + '. Contact: ' + df['Email'] + '.'
+# Step 2: Define document URLs (example URLs for agentic design patterns)
+urls = [
+    "https://www.deeplearning.ai/the-batch/how-agents-can-improve-llm-performance/?ref=dl-staging-website.ghost.io",
+    "https://www.deeplearning.ai/the-batch/agentic-design-patterns-part-2-reflection/?ref=dl-staging-website.ghost.io",
+    "https://www.deeplearning.ai/the-batch/agentic-design-patterns-part-3-tool-use/?ref=dl-staging-website.ghost.io",
+    "https://www.deeplearning.ai/the-batch/agentic-design-patterns-part-4-planning/?ref=dl-staging-website.ghost.io",
+    "https://www.deeplearning.ai/the-batch/agentic-design-patterns-part-5-multi-agent-collaboration/?ref=dl-staging-website.ghost.io"
+]
 
-# Step 3: Load the Sentence-BERT model (replacing Cohere embeddings)
-model = SentenceTransformer('all-MiniLM-L6-v2')  # Pre-trained model from Hugging Face
+# Step 3: Load documents from URLs (simplified loading, replace with your actual logic)
+from langchain_community.document_loaders import WebBaseLoader
+docs = []
+for url in urls:
+    loader = WebBaseLoader(url)
+    docs.extend(loader.load())
 
-# Step 4: Generate embeddings for the combined text
-doc_texts = df['combined_text'].tolist()  # Convert the combined text column to a list
-text_vectors = model.encode(doc_texts, convert_to_tensor=True)
+# Step 4: Split documents into chunks
+text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=0)
+doc_splits = text_splitter.split_documents(docs)
 
-# Step 5: Move the tensor to CPU and convert to a numpy array
-vector_matrix = text_vectors.cpu().numpy()
+# Step 5: Create FAISS vector store using Sentence-BERT embeddings
+vectorstore = FAISS.from_documents(doc_splits, embedding_model)
 
-# Step 6: Create the FAISS index (Using L2 distance-based search)
-index = faiss.IndexFlatL2(vector_matrix.shape[1])
+# Step 6: Set up retriever to get relevant documents based on the question
+retriever = vectorstore.as_retriever(search_type="similarity", search_kwargs={'k': 4})
 
-# Step 7: Add the vectors to the FAISS index
-index.add(vector_matrix)
+# Step 7: Define the question and retrieve documents
+question = "What are the different kinds of agentic design patterns?"
+docs = retriever.invoke(question)
 
-# Create a simple class to wrap the docstore
-class SimpleDocstore:
-    def __init__(self, docs):
-        self.docs = docs
-
-    def search(self, doc_id):
-        # Debugging: Check if we are accessing the correct document ID
-        print(f"Docstore search for doc_id: {doc_id}")
-        return self.docs.get(int(doc_id), "ID not found")
-
-# Step 8: Initialize the SimpleDocstore with the document texts wrapped in Document objects
-docstore = SimpleDocstore({i: Document(page_content=doc_texts[i]) for i in range(len(doc_texts))})
-
-# Create a mapping from index to document IDs
-index_to_docstore_id = {i: i for i in range(len(doc_texts))}
-
-# Debugging: Check the mapping
-print("Index to Docstore ID Mapping:")
-for i, doc_id in index_to_docstore_id.items():
-    document = docstore.search(doc_id)
-    if document:
-        print(f"Index: {i}, Docstore ID: {doc_id}, Document: {document.page_content}")
-    else:
-        print(f"Document not found for Docstore ID: {doc_id}")
-
-# Step 9: Define the embedding function using Hugging Face Embeddings (replacing Cohere)
-embedding_function = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
-
-# Step 10: Create a retriever using FAISS and adapt it for use with local models
-faiss_retriever = FAISS(
-    index=index,
-    docstore=docstore,
-    index_to_docstore_id=index_to_docstore_id,
-    embedding_function=embedding_function
-).as_retriever()
-
-# Load local language model (GPT-J or GPT-Neo from Hugging Face)
-# local_llm = pipeline('text-generation', model='EleutherAI/gpt-neo-1.3B')
-local_llm = pipeline('text-generation', model='EleutherAI/gpt-neo-1.3B', device=device)
-
-# Function to generate the answer using local LLM
-# def generate_answer_from_documents(query, docs):
-#     context = "\n".join([doc.page_content for doc in docs])
-#     input_text = f"Context: {context}\n\nQuestion: {query}\n\nAnswer:"
-
-#     # Generate answer using local LLM
-#     response = local_llm(input_text, max_length=200, do_sample=True)
-#     return response[0]['generated_text']
-
-# Function to generate the answer using OpenAI GPT-3.5
-def generate_answer_from_documents_gpt35(query, docs):
+# Step 8: Generate the answer using OpenAI GPT-3.5 with ChatCompletion
+def generate_answer_gpt35(query, docs):
+    # Format the retrieved documents
     context = "\n".join([doc.page_content for doc in docs])
-    input_text = f"Context: {context}\n\nQuestion: {query}\n\nAnswer:"
-    
-    openai_api_key = os.getenv('OPENAI_API_KEY')
-    if not openai_api_key:
-        raise ValueError("OpenAI API key not found in environment variables!")
-    
-    # Initialize the language model (using OpenAI GPT-3.5)
-    llm = ChatOpenAI(openai_api_key=openai_api_key, model="gpt-3.5-turbo-0125")
-    # Call OpenAI GPT-3.5 API for answer generation
-    # llm = OpenAI(temperature=0.7, model="gpt-3.5-turbo")  # You need to set OPENAI_API_KEY in your .env
-    response = llm(input_text)
-    return response
+    system_message = SystemMessage(content="You are an assistant for question-answering tasks. Answer the question based upon your knowledge. Use three-to-five sentences maximum and keep the answer concise.")
+    user_message = HumanMessage(content=f"Context: {context}\n\nQuestion: {query}\n\nAnswer:")
 
+    # Initialize the Chat GPT-3.5 model from OpenAI
+    openai_model = ChatOpenAI(model="gpt-3.5-turbo", openai_api_key=openai_api_key)
 
-# Example workflow:
-query = "where is Yvonne Farmer lived?"
+    # Use GPT-3.5 to generate the answer via chat completion
+    response = openai_model.invoke([system_message, user_message])
+    print("==========")
+    print(response)
+    # The response is already an AIMessage object; access its content
+    return response.content
 
-# Step 12: Retrieve documents based on the query using FAISS
-retrieved_docs = faiss_retriever.invoke(query)  # Retrieve documents using FAISS retriever
-
-# Step 13: Pass the query and retrieved documents to the local LLM for answer generation
-final_answer = generate_answer_from_documents_gpt35(query, retrieved_docs)
-
-# Display the final answer
+# Step 9: Generate the final answer
+final_answer = generate_answer_gpt35(question, docs)
 print(final_answer)
+
+# Step 10: (Optional) Hallucination Check (based on retrieved documents)
+# def hallucination_check(answer, docs):
+#     """
+#     This function checks if the answer generated by the LLM is grounded in the retrieved documents.
+#     It searches for segments of the answer within the content of the retrieved documents.
+    
+#     :param answer: The generated answer by the LLM.
+#     :param docs: List of retrieved documents used to generate the answer.
+#     :return: True if the answer is grounded in the documents, False if it appears to be hallucinated.
+#     """
+#     answer_lower = answer.lower()  # Convert answer to lowercase for comparison
+
+#     # Iterate through each retrieved document
+#     for doc in docs:
+#         doc_content_lower = doc.page_content.lower()  # Convert document content to lowercase
+#         if answer_lower in doc_content_lower:
+#             # If the answer (or parts of it) is found in the document, it's considered grounded
+#             return True
+#     # If the answer is not found in any document, it's considered hallucinated
+#     return False
+
+
+# Data model for hallucination check
+class GradeHallucinations(BaseModel):
+    """Binary score for hallucination present in 'generation' answer."""
+    binary_score: str = Field(description="Answer is grounded in the facts, 'yes' or 'no'")
+
+# Initialize GPT-3.5 model
+openai_api_key = os.getenv("OPENAI_API_KEY")
+gpt35 = ChatOpenAI(model="gpt-3.5-turbo", openai_api_key=openai_api_key)
+
+# System message for hallucination check
+system_hallucination = """You are a grader assessing whether an LLM generation is grounded in / supported by a set of retrieved facts. 
+Give a binary score 'yes' or 'no'. 'Yes' means that the answer is grounded in / supported by the set of facts."""
+
+# User message template for hallucination check
+hallucination_prompt = ChatPromptTemplate.from_messages([
+    ("system", system_hallucination),
+    ("human", "Set of facts: \n\n {documents} \n\n LLM generation: {generation}")
+])
+
+# Chain for hallucination check
+def hallucination_check(docs_to_use, generation):
+    # Format the retrieved documents
+    formatted_docs = "\n".join([doc.page_content for doc in docs_to_use])
+    system_message = SystemMessage(content=system_hallucination)
+    user_message = HumanMessage(content=f"Set of facts: \n\n {formatted_docs} \n\n LLM generation: {generation}")
+    
+    response = gpt35.invoke([system_message, user_message])
+    return response.content
+
+# Refactor document highlighting with GPT-3.5
+
+# Data model for document highlighting
+class HighlightDocuments(BaseModel):
+    id: List[str] = Field(description="List of id of docs used to answer the question")
+    title: List[str] = Field(description="List of titles used to answer the question")
+    source: List[str] = Field(description="List of sources used to answer the question")
+    segment: List[str] = Field(description="List of direct segments from used documents that answer the question")
+
+# System message for document highlighting
+system_highlight = """You are an advanced assistant for document search and retrieval. 
+You are provided with the following:
+1. A question.
+2. A generated answer based on the question.
+3. A set of documents that were referenced in generating the answer.
+
+Your task is to identify and extract the exact inline segments from the provided documents that directly correspond to the content used to 
+generate the given answer. The extracted segments must be verbatim snippets from the documents, ensuring a word-for-word match with the text 
+in the provided documents."""
+
+# User message template for document highlighting
+highlight_prompt = ChatPromptTemplate.from_messages([
+    ("system", system_highlight),
+    ("human", "Used documents: {documents} \n\n User question: {question} \n\n Generated answer: {generation}")
+])
+
+# Function to highlight used document segments
+def highlight_segments(docs_to_use, question, generation):
+    formatted_docs = "\n".join([doc.page_content for doc in docs_to_use])
+    system_message = SystemMessage(content=system_highlight)
+    user_message = HumanMessage(content=f"Used documents: {formatted_docs} \n\n User question: {question} \n\n Generated answer: {generation}")
+    
+    response = gpt35.invoke([system_message, user_message])
+    return response.content
+
+
+# Run hallucination check
+hallucination_result = hallucination_check(docs, final_answer)
+print(f"Hallucination check result: {hallucination_result}")
+
+# Run document highlighting
+highlight_result = highlight_segments(docs, question, final_answer)
+print(f"Highlighted segments: {highlight_result}")
